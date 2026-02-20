@@ -160,9 +160,9 @@ export async function sendPromptAndCollect(
 				headers: { "Content-Type": "application/json" },
 				signal: ac.signal,
 				body: JSON.stringify({
-					model: model
+					...(model
 						? { providerID: model.providerID, modelID: model.modelID }
-						: undefined,
+						: {}),
 					parts: [{ type: "text", text: promptText }],
 				}),
 			},
