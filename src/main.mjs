@@ -424,7 +424,7 @@ async function main() {
 	// Load config
 	const configPath = INPUT_CONFIG_PATH || ".ai-review.yml";
 	const config = loadConfig(configPath, {
-		model: INPUT_MODEL,
+		model: INPUT_MODEL || "",
 		timeout_minutes: INPUT_TIMEOUT_MINUTES,
 	});
 

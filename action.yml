@@ -18,9 +18,8 @@ inputs:
 
   # Model
   model:
-    description: 'Model to use (provider/model format, e.g. openai/gpt-4o)'
+    description: 'Model to use (provider/model format, e.g. openai/gpt-4o). Overrides config file if set.'
     required: false
-    default: 'openai/gpt-4o'
 
   # GitHub
   github-token:
