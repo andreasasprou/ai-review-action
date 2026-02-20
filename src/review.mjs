@@ -561,9 +561,27 @@ export async function runReview(ctx) {
 
 		// ── Run complete ──
 		const duration = Math.round((Date.now() - startTime) / 1000);
+
+		// Count files that were actually sent to the LLM and got a response
+		const filesActuallyReviewed = Object.values(fileResults).filter(
+			(r) => r.status === "clean" || r.status === "issues",
+		).length;
+
 		const hasP0 = allFindings.some((f) => f.severity === "P0");
 		const hasP1 = allFindings.some((f) => f.severity === "P1");
-		const verdict = hasP0 ? "BLOCK" : hasP1 ? "ATTENTION" : "OK";
+
+		// If the review was cut short and zero files were actually reviewed
+		// (e.g., circuit breaker tripped immediately), that's an error — not a clean bill.
+		let verdict;
+		if (reviewCapped && filesActuallyReviewed === 0) {
+			verdict = "ERROR";
+		} else if (hasP0) {
+			verdict = "BLOCK";
+		} else if (hasP1) {
+			verdict = "ATTENTION";
+		} else {
+			verdict = "OK";
+		}
 
 		// Build open_issues for dashboard state
 		const openIssues = allFindings.map((f, i) => ({

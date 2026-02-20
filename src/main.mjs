@@ -199,6 +199,10 @@ async function finalizeCheckRun(checkId, opts) {
 		summary = hasReview
 			? reviewBody
 			: "Unable to generate a review. Check the workflow logs for details.";
+	} else if (verdict === "ERROR") {
+		conclusion = "failure";
+		title = `Review Failed - No Files Reviewed (${model})`;
+		summary = reviewBody;
 	} else if (verdict === "BLOCK" || verdict === "ATTENTION") {
 		title =
 			verdict === "BLOCK"
