@@ -669,6 +669,10 @@ async function main() {
 		console.log(
 			`Done: ${result.verdict} (${result.totalFindings} findings, ${result.duration}s)`,
 		);
+
+		// Explicitly exit — the OpenCode server spawns child processes that can
+		// keep the Node event loop alive even after server.close().
+		process.exit(0);
 	} catch (err) {
 		console.error("Review failed:", err);
 
