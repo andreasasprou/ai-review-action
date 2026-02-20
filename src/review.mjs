@@ -123,6 +123,7 @@ export async function runReview(ctx) {
 		changedFiles,
 		previousState,
 		config,
+		sdkConfig,
 	} = ctx;
 
 	const { providerID, modelID } = parseProviderModel(model);
@@ -179,7 +180,7 @@ export async function runReview(ctx) {
 	}
 
 	const startTime = Date.now();
-	const opencode = await startOpencode(model);
+	const opencode = await startOpencode(model, undefined, sdkConfig);
 
 	try {
 		// ── Session management ──
