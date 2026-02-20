@@ -134,6 +134,12 @@ export async function runReview(ctx) {
 
 	const maxFindings = config.review?.max_findings_per_file || 3;
 	const MAX_TOTAL_FINDINGS = config.review?.max_total_findings || 15;
+	const MAX_COMMENTABLE_LINES = 1500;
+	const PER_PROMPT_TIMEOUT_MS = 90_000; // 90 seconds per LLM call
+	const MAX_RETRY_ATTEMPTS = 2;
+	const MAX_CONSECUTIVE_FAILURES = 3;
+	// Leave 4 minutes for cleanup, dashboard update, and post-step
+	const RUNTIME_BUDGET_MS = 16 * 60 * 1000;
 
 	const state = previousState || {};
 
@@ -265,12 +271,22 @@ export async function runReview(ctx) {
 		}
 
 		let totalFindings = 0;
+		let consecutiveFailures = 0;
 		let reviewCapped = false;
 		const allFindings = [];
 		const reviewedFiles = [...alreadyReviewed];
 		const fileResults = {};
 
-		for (const file of changedFiles) {
+		// Prioritize: production code first, then relaxed (tests/scripts/config).
+		// This ensures the runtime budget is spent on the most important files.
+		const prioritized = [...changedFiles].sort((a, b) => {
+			const priority = { standard: 0, relaxed: 1, skip: 2 };
+			return (
+				(priority[classify(a)] ?? 2) - (priority[classify(b)] ?? 2)
+			);
+		});
+
+		for (const file of prioritized) {
 			if (alreadyReviewed.has(file)) {
 				console.log(`Skipping ${file} (already reviewed in checkpoint)`);
 				continue;
@@ -304,6 +320,29 @@ export async function runReview(ctx) {
 			}
 
 			const { numbered, commentable } = buildNumberedRightDiff(patch);
+
+			// Skip files with very large diffs — they consume too much LLM time
+			// and are typically refactors/moves where line-by-line review adds little value.
+			if (commentable.size > MAX_COMMENTABLE_LINES) {
+				console.log(
+					`Skipping ${file} (${commentable.size} commentable lines exceeds ${MAX_COMMENTABLE_LINES} cap)`,
+				);
+				reviewedFiles.push(file);
+				fileResults[file] = {
+					status: "skipped_large",
+					findings_count: 0,
+				};
+				continue;
+			}
+
+			// Runtime budget check — exit gracefully before the hard timeout kills us
+			if (Date.now() - startTime > RUNTIME_BUDGET_MS) {
+				console.log(
+					`Runtime budget exhausted (${Math.round((Date.now() - startTime) / 1000)}s), stopping review`,
+				);
+				reviewCapped = true;
+				break;
+			}
 
 			console.log(
 				`Reviewing ${file} (${commentable.size} commentable lines)...`,
@@ -343,11 +382,23 @@ export async function runReview(ctx) {
 			});
 
 			let structured = { comments: [] };
+			let promptSucceeded = false;
 			try {
 				const responseText = await withRetry(
-					() => sendPromptAndCollect(opencode, sessionId, prompt, null),
-					{ maxAttempts: 3, baseDelayMs: 3000 },
+					() =>
+						sendPromptAndCollect(
+							opencode,
+							sessionId,
+							prompt,
+							null,
+							PER_PROMPT_TIMEOUT_MS,
+						),
+					{ maxAttempts: MAX_RETRY_ATTEMPTS, baseDelayMs: 3000 },
 				);
+
+				// Transport succeeded — reset circuit breaker regardless of parse outcome
+				promptSucceeded = true;
+				consecutiveFailures = 0;
 
 				if (process.env.DEBUG_OPENCODE) {
 					console.log(
@@ -365,6 +416,25 @@ export async function runReview(ctx) {
 				}
 			} catch (err) {
 				console.log(`Model prompt failed for ${file}: ${err.message}`);
+				if (!promptSucceeded) {
+					// Only count transport/fetch failures toward the circuit breaker,
+					// not JSON parse errors from a successful but malformed response.
+					consecutiveFailures++;
+					if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+						console.log(
+							`${MAX_CONSECUTIVE_FAILURES} consecutive transport failures — OpenCode server likely unhealthy, stopping review`,
+						);
+						reviewCapped = true;
+						break;
+					}
+					// Don't record the file as reviewed — it wasn't.
+					// This allows resume runs to re-attempt it.
+					fileResults[file] = {
+						status: "failed",
+						findings_count: 0,
+					};
+					continue;
+				}
 			}
 
 			// Severity safety net for relaxed files

@@ -36,6 +36,7 @@ function isTransientFetchError(err) {
 	const causeCode = err?.cause?.code || "";
 	return (
 		msg.includes("fetch failed") ||
+		msg.includes("sendPromptAndCollect timed out") ||
 		causeCode === "UND_ERR_HEADERS_TIMEOUT" ||
 		causeCode === "ECONNRESET" ||
 		causeCode === "ECONNREFUSED" ||
@@ -125,35 +126,11 @@ export async function sendPromptAndCollect(
 	{ onEvent } = {},
 ) {
 	const serverUrl = opencode.server.url;
-
-	// Set up SSE event stream FIRST
 	const ac = new AbortController();
-	const eventUrl = `${serverUrl}/event`;
-	const sseResp = await fetch(eventUrl, {
-		headers: { Accept: "text/event-stream" },
-		signal: ac.signal,
-	});
-	if (!sseResp.ok || !sseResp.body) {
-		throw new Error(`SSE connect failed: ${sseResp.status}`);
-	}
 
-	// Send the prompt (fire-and-forget)
-	const promptResp = await fetch(`${serverUrl}/session/${sessionId}/message`, {
-		method: "POST",
-		headers: { "Content-Type": "application/json" },
-		body: JSON.stringify({
-			model: model
-				? { providerID: model.providerID, modelID: model.modelID }
-				: undefined,
-			parts: [{ type: "text", text: promptText }],
-		}),
-	});
-	if (!promptResp.ok) {
-		ac.abort();
-		const body = await promptResp.text();
-		throw new Error(`Prompt send failed: ${promptResp.status} ${body}`);
-	}
-
+	// Start the timeout IMMEDIATELY so it covers SSE connect, prompt POST,
+	// AND the response-wait phase. Previously the timer was set only after
+	// both fetches succeeded, so a hanging fetch would block indefinitely.
 	const timer = setTimeout(() => {
 		console.log(
 			`  [TIMEOUT] sendPromptAndCollect timed out after ${timeoutMs / 1000}s`,
@@ -161,12 +138,47 @@ export async function sendPromptAndCollect(
 		ac.abort();
 	}, timeoutMs);
 
-	let latestPartText = "";
-	let eventCount = 0;
-	const reader = sseResp.body.pipeThrough(new TextDecoderStream()).getReader();
-	let buffer = "";
-
+	let reader;
 	try {
+		// Set up SSE event stream
+		const eventUrl = `${serverUrl}/event`;
+		const sseResp = await fetch(eventUrl, {
+			headers: { Accept: "text/event-stream" },
+			signal: ac.signal,
+		});
+		if (!sseResp.ok || !sseResp.body) {
+			throw new Error(`SSE connect failed: ${sseResp.status}`);
+		}
+
+		// Send the prompt — include abort signal so a timeout can cancel it
+		const promptResp = await fetch(
+			`${serverUrl}/session/${sessionId}/message`,
+			{
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				signal: ac.signal,
+				body: JSON.stringify({
+					model: model
+						? { providerID: model.providerID, modelID: model.modelID }
+						: undefined,
+					parts: [{ type: "text", text: promptText }],
+				}),
+			},
+		);
+		if (!promptResp.ok) {
+			const body = await promptResp.text();
+			throw new Error(`Prompt send failed: ${promptResp.status} ${body}`);
+		}
+
+		// Read SSE events until session.idle.
+		// Track the latest accumulated text from message.part.updated and
+		// return it when session.idle fires. This is simpler and more reliable
+		// than concatenating deltas (which can duplicate on retransmit).
+		let latestPartText = "";
+		let eventCount = 0;
+		reader = sseResp.body.pipeThrough(new TextDecoderStream()).getReader();
+		let buffer = "";
+
 		while (true) {
 			const { done, value } = await reader.read();
 			if (done) break;
@@ -225,8 +237,6 @@ export async function sendPromptAndCollect(
 						typeof event.properties?.error === "string"
 							? event.properties.error
 							: JSON.stringify(event.properties?.error ?? event.properties);
-					clearTimeout(timer);
-					ac.abort();
 					throw new Error(`OpenCode session error: ${errMsg}`);
 				}
 
@@ -239,22 +249,31 @@ export async function sendPromptAndCollect(
 							`  [SSE] session.idle, response length: ${latestPartText.length}`,
 						);
 					}
-					clearTimeout(timer);
-					ac.abort();
 					return latestPartText;
 				}
 			}
 		}
+
+		return latestPartText;
 	} catch (err) {
-		if (err.name !== "AbortError") throw err;
+		// Convert AbortError from our timeout into a descriptive error
+		// so callers (withRetry) see a meaningful message.
+		if (err.name === "AbortError") {
+			throw new Error(
+				`sendPromptAndCollect timed out after ${timeoutMs / 1000}s`,
+			);
+		}
+		throw err;
 	} finally {
+		// Always clean up: cancel the timer, abort the SSE stream, release
+		// the reader. This prevents SSE connection leaks when the prompt
+		// POST fails or the function throws for any reason.
 		clearTimeout(timer);
+		ac.abort();
 		try {
-			reader.releaseLock();
+			reader?.releaseLock();
 		} catch {}
 	}
-
-	return latestPartText;
 }
 
 // ── State management ─────────────────────────────────────────────────────────
