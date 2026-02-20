@@ -88,10 +88,9 @@ export function parseProviderModel(model) {
 // ── OpenCode server lifecycle ────────────────────────────────────────────────
 
 /**
- * Start an OpenCode server with the given model, permission overrides,
- * and optional extra config (e.g., plugin for codex auth).
+ * Start an OpenCode server with the given model and permission overrides.
  */
-export async function startOpencode(model, permissions, extraConfig) {
+export async function startOpencode(model, permissions) {
 	return createOpencode({
 		timeout: 30_000,
 		config: {
@@ -103,7 +102,6 @@ export async function startOpencode(model, permissions, extraConfig) {
 				glob: "allow",
 				list: "allow",
 			},
-			...extraConfig,
 		},
 	});
 }

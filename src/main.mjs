@@ -356,30 +356,25 @@ function generateOpencodeConfig(model, config) {
 		};
 	}
 
-	// Check if using OpenCode auth mode — plugin goes via SDK config
-	// (not opencode.json, which rejects unknown keys)
+	// Check if using OpenCode auth mode — include codex auth plugin
 	const authModeFile = path.join(
 		process.env.HOME || "",
 		".local/share/opencode/.auth-mode",
 	);
-	let plugin;
 	if (fs.existsSync(authModeFile)) {
 		const authMode = fs.readFileSync(authModeFile, "utf8").trim();
 		if (authMode === "opencode") {
 			const pluginPath = ACTION_PATH
 				? path.join(ACTION_PATH, "node_modules/opencode-openai-codex-auth")
 				: "opencode-openai-codex-auth";
-			plugin = [pluginPath];
+			opencodeConfig.plugin = [pluginPath];
 			console.log(`Using OpenCode codex auth plugin: ${pluginPath}`);
 		}
 	}
 
-	// Write opencode.json (provider/model options only — no plugin)
+	// Write opencode.json to current directory
 	fs.writeFileSync("opencode.json", JSON.stringify(opencodeConfig, null, 2));
 	console.log(`Generated opencode.json for ${model}`);
-
-	// Return extra config to pass via SDK (OPENCODE_CONFIG_CONTENT)
-	return { plugin };
 }
 
 // ── Dashboard cancel/fail handler ────────────────────────────────────────────
@@ -609,7 +604,7 @@ async function main() {
 		}
 
 		// ── Generate opencode.json ──
-		const sdkConfig = generateOpencodeConfig(model, config);
+		generateOpencodeConfig(model, config);
 
 		// ── Load context files ──
 		const guidelinesContent = loadContextFiles(config.context_files || []);
@@ -631,7 +626,6 @@ async function main() {
 			changedFiles,
 			previousState,
 			config,
-			sdkConfig,
 		});
 
 		// ── Build review summary ──
