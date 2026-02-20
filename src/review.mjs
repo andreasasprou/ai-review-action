@@ -391,7 +391,7 @@ export async function runReview(ctx) {
 							opencode,
 							sessionId,
 							prompt,
-							null,
+							{ providerID, modelID },
 							PER_PROMPT_TIMEOUT_MS,
 						),
 					{ maxAttempts: MAX_RETRY_ATTEMPTS, baseDelayMs: 3000 },
