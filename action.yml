@@ -1,0 +1,88 @@
+name: 'AI PR Review'
+description: 'AI-powered code review using OpenCode SDK. Posts inline comments with severity-calibrated findings and a live dashboard.'
+branding:
+  icon: 'code'
+  color: 'blue'
+
+inputs:
+  # Auth (at least one required)
+  anthropic-api-key:
+    description: 'Anthropic API key (sk-ant-...)'
+    required: false
+  openai-api-key:
+    description: 'OpenAI API key (sk-...)'
+    required: false
+  opencode-auth-json-b64:
+    description: 'Base64-encoded OpenCode auth.json (alternative to individual API keys)'
+    required: false
+
+  # Model
+  model:
+    description: 'Model to use (provider/model format, e.g. openai/gpt-4o)'
+    required: false
+    default: 'openai/gpt-4o'
+
+  # GitHub
+  github-token:
+    description: 'GitHub token for PR comments and checks'
+    required: false
+    default: ${{ github.token }}
+
+  # Config
+  config-path:
+    description: 'Path to config file relative to repo root'
+    required: false
+    default: '.ai-review.yml'
+  timeout-minutes:
+    description: 'Review timeout in minutes'
+    required: false
+    default: '20'
+  command:
+    description: 'Slash command that triggers the review (for issue_comment events)'
+    required: false
+    default: '/ai-review'
+
+outputs:
+  verdict:
+    description: 'Review verdict: OK, ATTENTION, or BLOCK'
+    value: ${{ steps.review.outputs.verdict }}
+  findings-count:
+    description: 'Number of findings posted'
+    value: ${{ steps.review.outputs.findings_count }}
+  dashboard-comment-id:
+    description: 'ID of the dashboard comment'
+    value: ${{ steps.review.outputs.dashboard_comment_id }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '22'
+
+    - name: Install dependencies
+      shell: bash
+      run: |
+        npm ci --prefix "${{ github.action_path }}"
+        echo "${{ github.action_path }}/node_modules/.bin" >> "$GITHUB_PATH"
+
+    - name: Setup auth
+      shell: bash
+      env:
+        INPUT_ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
+        INPUT_OPENAI_API_KEY: ${{ inputs.openai-api-key }}
+        INPUT_OPENCODE_AUTH_JSON_B64: ${{ inputs.opencode-auth-json-b64 }}
+      run: node "${{ github.action_path }}/src/auth.mjs"
+
+    - name: Run review
+      id: review
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        INPUT_MODEL: ${{ inputs.model }}
+        INPUT_CONFIG_PATH: ${{ inputs.config-path }}
+        INPUT_TIMEOUT_MINUTES: ${{ inputs.timeout-minutes }}
+        INPUT_COMMAND: ${{ inputs.command }}
+        ACTION_PATH: ${{ github.action_path }}
+      run: node "${{ github.action_path }}/src/main.mjs"

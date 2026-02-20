@@ -1,0 +1,62 @@
+# AI Review configuration
+# Place this file as .ai-review.yml in your repo root.
+# All fields are optional — sensible defaults are used if omitted.
+
+# Model in provider/model format
+model: openai/gpt-4o
+# model_options:
+#   reasoningEffort: high
+
+# File classification patterns (picomatch globs)
+# "*.md" matches at any depth (e.g. docs/readme.md)
+files:
+  skip:
+    - "*.md"
+    - "*.mdx"
+    - "*.css"
+    - "*.svg"
+    - "*.png"
+    - "*.jpg"
+    - "*.gif"
+    - "*.ico"
+    - "*.woff"
+    - "*.woff2"
+    - "*.lock"
+    - "*.d.ts"
+    - ".github/**"
+    - "__generated__/**"
+    - "**/generated/**"
+  relaxed:
+    - "*.test.ts"
+    - "*.test.tsx"
+    - "*.test.js"
+    - "*.test.jsx"
+    - "*.spec.ts"
+    - "*.spec.tsx"
+    - "*.spec.js"
+    - "*.spec.jsx"
+    - "__tests__/**"
+    - "scripts/**"
+    - "*.yml"
+    - "*.yaml"
+    - "*.json"
+
+# Project guidelines injected into the review prompt
+# context_files:
+#   - AGENTS.md
+
+# Prompt customization
+# prompt:
+#   project_type: "TypeScript monorepo"
+#   preamble: |
+#     Additional instructions here.
+
+# Review limits
+review:
+  max_findings_per_file: 3
+  max_total_findings: 15
+
+# Dashboard branding
+dashboard:
+  marker: "ai-review"
+  title: "AI Review Dashboard"

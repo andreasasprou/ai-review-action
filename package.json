@@ -1,0 +1,20 @@
+{
+  "name": "ai-review-action",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "AI-powered code review GitHub Action using OpenCode SDK",
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "test": "node --test __tests__/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@opencode-ai/sdk": "1.2.6",
+    "js-yaml": "^4.1.0",
+    "opencode-ai": "^0.1.0",
+    "picomatch": "^4.0.0"
+  }
+}
