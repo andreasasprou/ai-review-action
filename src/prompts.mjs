@@ -104,6 +104,10 @@ export function buildSystemPrompt({
 		`still flag genuine issues, but acknowledge when the author has already considered a trade-off.`,
 		`Prefer fewer, higher-quality comments. Aim for the minimum number of comments that would`,
 		`actually improve the code.`,
+		``,
+		`### IMPORTANT: Response constraints`,
+		`Do NOT execute any commands, read any files, or use any tools.`,
+		`Review ONLY the diff provided. Respond with the JSON output immediately.`,
 	);
 
 	return parts.join("\n");
