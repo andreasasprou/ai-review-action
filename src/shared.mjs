@@ -1,8 +1,8 @@
 // Shared utilities for AI review orchestration.
-// OpenCode SDK lifecycle, GitHub API, SSE response collection, retry logic.
+// Codex CLI subprocess management, GitHub API, retry logic.
 
 import fs from "node:fs";
-import { createOpencode } from "@opencode-ai/sdk";
+import { spawn } from "node:child_process";
 
 // ── Retry helper ─────────────────────────────────────────────────────────────
 
@@ -19,7 +19,7 @@ export async function withRetry(fn, opts = {}) {
 			lastError = err;
 			const retryable = isRetryable
 				? isRetryable(err)
-				: isTransientFetchError(err);
+				: isTransientError(err);
 			if (!retryable || attempt >= maxAttempts) throw err;
 			const delay = baseDelayMs * 2 ** (attempt - 1);
 			console.log(
@@ -31,17 +31,14 @@ export async function withRetry(fn, opts = {}) {
 	throw lastError;
 }
 
-function isTransientFetchError(err) {
+function isTransientError(err) {
 	const msg = err?.message || "";
-	const causeCode = err?.cause?.code || "";
 	return (
-		msg.includes("fetch failed") ||
-		msg.includes("sendPromptAndCollect timed out") ||
-		causeCode === "UND_ERR_HEADERS_TIMEOUT" ||
-		causeCode === "ECONNRESET" ||
-		causeCode === "ECONNREFUSED" ||
-		causeCode === "UND_ERR_SOCKET" ||
-		causeCode === "ETIMEDOUT"
+		msg.includes("timed out") ||
+		msg.includes("Codex exec failed") ||
+		msg.includes("ECONNRESET") ||
+		msg.includes("ECONNREFUSED") ||
+		msg.includes("ETIMEDOUT")
 	);
 }
 
@@ -85,195 +82,114 @@ export function parseProviderModel(model) {
 	return { providerID: model.slice(0, idx), modelID: model.slice(idx + 1) };
 }
 
-// ── OpenCode server lifecycle ────────────────────────────────────────────────
+// ── Codex CLI subprocess ─────────────────────────────────────────────────────
 
 /**
- * Start an OpenCode server with the given model and permission overrides.
- */
-export async function startOpencode(model, permissions) {
-	return createOpencode({
-		timeout: 30_000,
-		config: {
-			model,
-			permission: permissions || {
-				"*": "deny",
-				read: "allow",
-				grep: "allow",
-				glob: "allow",
-				list: "allow",
-			},
-		},
-	});
-}
-
-// ── SSE response collection ──────────────────────────────────────────────────
-
-/**
- * Send a prompt to an OpenCode session and collect the full response via SSE.
+ * Send a prompt to Codex via `codex exec --json` and collect the response.
  *
- * OpenCode's session.prompt() is fire-and-forget (HTTP 200 with empty body).
- * We listen to the SSE event stream for:
- *   - message.part.updated → { part: { text: "full accumulated text" } }
- *   - session.error → throw
- *   - session.idle → return collected text
+ * Spawns a subprocess that outputs JSONL events on stdout. Extracts
+ * agent_message text and returns it as a string.
+ *
+ * @param {string} prompt — The review prompt
+ * @param {object} [opts]
+ * @param {string} [opts.model] — Model name (e.g. "gpt-5.2")
+ * @param {string} [opts.workingDirectory] — Working directory for codex
+ * @param {number} [opts.timeoutMs] — Timeout in ms (default: 300s)
+ * @param {string} [opts.reasoningEffort] — Reasoning effort level
+ * @returns {Promise<string>} — The agent response text
  */
-export async function sendPromptAndCollect(
-	opencode,
-	sessionId,
-	promptText,
-	model,
-	timeoutMs = 300_000,
-	{ onEvent } = {},
-) {
-	const serverUrl = opencode.server.url;
-	const ac = new AbortController();
+export async function sendCodexPrompt(prompt, opts = {}) {
+	const {
+		model,
+		workingDirectory,
+		timeoutMs = 300_000,
+		reasoningEffort,
+	} = opts;
 
-	// Start the timeout IMMEDIATELY so it covers SSE connect, prompt POST,
-	// AND the response-wait phase. Previously the timer was set only after
-	// both fetches succeeded, so a hanging fetch would block indefinitely.
-	const timer = setTimeout(() => {
-		console.log(
-			`  [TIMEOUT] sendPromptAndCollect timed out after ${timeoutMs / 1000}s`,
-		);
-		ac.abort();
-	}, timeoutMs);
+	const args = [
+		"exec",
+		"--json",
+		"--full-auto",
+		"--ephemeral",
+		"-c", 'sandbox_mode="read-only"',
+	];
 
-	let reader;
-	try {
-		// Set up SSE event stream
-		const eventUrl = `${serverUrl}/event`;
-		const sseResp = await fetch(eventUrl, {
-			headers: { Accept: "text/event-stream" },
-			signal: ac.signal,
+	if (reasoningEffort) {
+		args.push("-c", `model_reasoning_effort="${reasoningEffort}"`);
+	}
+
+	if (model) {
+		args.push("-m", model);
+	}
+
+	args.push(prompt);
+
+	return new Promise((resolve, reject) => {
+		const child = spawn("codex", args, {
+			cwd: workingDirectory || process.cwd(),
+			stdio: ["pipe", "pipe", "pipe"],
+			env: { ...process.env },
 		});
-		if (!sseResp.ok || !sseResp.body) {
-			throw new Error(`SSE connect failed: ${sseResp.status}`);
-		}
 
-		// Send the prompt — include abort signal so a timeout can cancel it
-		const promptResp = await fetch(
-			`${serverUrl}/session/${sessionId}/message`,
-			{
-				method: "POST",
-				headers: { "Content-Type": "application/json" },
-				signal: ac.signal,
-				body: JSON.stringify({
-					...(model
-						? { providerID: model.providerID, modelID: model.modelID }
-						: {}),
-					parts: [{ type: "text", text: promptText }],
-				}),
-			},
-		);
-		if (!promptResp.ok) {
-			const body = await promptResp.text();
-			throw new Error(`Prompt send failed: ${promptResp.status} ${body}`);
-		}
+		let stdout = "";
+		let stderr = "";
+		let agentText = "";
 
-		// Read SSE events until session.idle.
-		// Track the latest accumulated text from message.part.updated and
-		// return it when session.idle fires. This is simpler and more reliable
-		// than concatenating deltas (which can duplicate on retransmit).
-		let latestPartText = "";
-		let eventCount = 0;
-		reader = sseResp.body.pipeThrough(new TextDecoderStream()).getReader();
-		let buffer = "";
+		const timer = setTimeout(() => {
+			child.kill("SIGTERM");
+			reject(new Error(`sendCodexPrompt timed out after ${timeoutMs / 1000}s`));
+		}, timeoutMs);
 
-		while (true) {
-			const { done, value } = await reader.read();
-			if (done) break;
-			buffer += value;
-			const chunks = buffer.split("\n\n");
-			buffer = chunks.pop() ?? "";
+		child.stdout.on("data", (chunk) => {
+			stdout += chunk.toString();
+			const lines = stdout.split("\n");
+			stdout = lines.pop() || "";
 
-			for (const chunk of chunks) {
-				const lines = chunk.split("\n");
-				const dataLines = [];
-				for (const line of lines) {
-					if (line.startsWith("data:")) {
-						dataLines.push(line.replace(/^data:\s*/, ""));
-					}
-				}
-				if (!dataLines.length) continue;
-				let event;
+			for (const line of lines) {
+				if (!line.trim()) continue;
 				try {
-					event = JSON.parse(dataLines.join("\n"));
+					const event = JSON.parse(line);
+					if (event.type === "item.completed" && event.item?.type === "agent_message") {
+						agentText += (agentText ? "\n" : "") + event.item.text;
+					}
 				} catch {
-					continue;
-				}
-
-				eventCount++;
-				if (process.env.DEBUG_OPENCODE) {
-					const sid = event.properties?.sessionID || "";
-					console.log(
-						`  [SSE] #${eventCount} ${event.type} (session=${sid.slice(0, 12)}...)`,
-					);
-				}
-
-				if (onEvent) {
-					try {
-						onEvent(event);
-					} catch (callbackErr) {
-						if (process.env.DEBUG_OPENCODE) {
-							console.log(
-								`  [SSE] onEvent callback error: ${callbackErr.message}`,
-							);
-						}
-					}
-				}
-
-				if (
-					event.type === "message.part.updated" &&
-					event.properties?.part?.text
-				) {
-					latestPartText = event.properties.part.text;
-				}
-
-				if (
-					event.type === "session.error" &&
-					event.properties?.sessionID === sessionId
-				) {
-					const errMsg =
-						typeof event.properties?.error === "string"
-							? event.properties.error
-							: JSON.stringify(event.properties?.error ?? event.properties);
-					throw new Error(`OpenCode session error: ${errMsg}`);
-				}
-
-				if (
-					event.type === "session.idle" &&
-					event.properties?.sessionID === sessionId
-				) {
-					if (process.env.DEBUG_OPENCODE) {
-						console.log(
-							`  [SSE] session.idle, response length: ${latestPartText.length}`,
-						);
-					}
-					return latestPartText;
+					// Ignore non-JSON lines
 				}
 			}
-		}
+		});
 
-		return latestPartText;
-	} catch (err) {
-		// Convert AbortError from our timeout into a descriptive error
-		// so callers (withRetry) see a meaningful message.
-		if (err.name === "AbortError") {
-			throw new Error(
-				`sendPromptAndCollect timed out after ${timeoutMs / 1000}s`,
-			);
-		}
-		throw err;
-	} finally {
-		// Always clean up: cancel the timer, abort the SSE stream, release
-		// the reader. This prevents SSE connection leaks when the prompt
-		// POST fails or the function throws for any reason.
-		clearTimeout(timer);
-		ac.abort();
-		try {
-			reader?.releaseLock();
-		} catch {}
-	}
+		child.stderr.on("data", (chunk) => {
+			stderr += chunk.toString();
+		});
+
+		child.on("close", (code) => {
+			clearTimeout(timer);
+
+			// Parse any remaining stdout
+			if (stdout.trim()) {
+				try {
+					const event = JSON.parse(stdout.trim());
+					if (event.type === "item.completed" && event.item?.type === "agent_message") {
+						agentText += (agentText ? "\n" : "") + event.item.text;
+					}
+				} catch {}
+			}
+
+			if (code !== 0 && !agentText) {
+				reject(new Error(`Codex exec failed (exit ${code}): ${stderr.slice(0, 500)}`));
+				return;
+			}
+
+			resolve(agentText);
+		});
+
+		child.on("error", (err) => {
+			clearTimeout(timer);
+			reject(err);
+		});
+
+		child.stdin.end();
+	});
 }
 
 // ── State management ─────────────────────────────────────────────────────────

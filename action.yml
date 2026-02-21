@@ -1,19 +1,16 @@
 name: 'AI PR Review'
-description: 'AI-powered code review using OpenCode SDK. Posts inline comments with severity-calibrated findings and a live dashboard.'
+description: 'AI-powered code review using Codex CLI. Posts inline comments with severity-calibrated findings and a live dashboard.'
 branding:
   icon: 'code'
   color: 'blue'
 
 inputs:
   # Auth (at least one required)
-  anthropic-api-key:
-    description: 'Anthropic API key (sk-ant-...)'
+  codex-auth-json-b64:
+    description: 'Base64-encoded Codex auth.json (ChatGPT OAuth tokens)'
     required: false
   openai-api-key:
     description: 'OpenAI API key (sk-...)'
-    required: false
-  opencode-auth-json-b64:
-    description: 'Base64-encoded OpenCode auth.json (alternative to individual API keys)'
     required: false
 
   # Model
@@ -66,12 +63,15 @@ runs:
         npm ci --prefix "${{ github.action_path }}"
         echo "${{ github.action_path }}/node_modules/.bin" >> "$GITHUB_PATH"
 
+    - name: Install Codex CLI
+      shell: bash
+      run: npm install -g @openai/codex
+
     - name: Setup auth
       shell: bash
       env:
-        INPUT_ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
+        INPUT_CODEX_AUTH_JSON_B64: ${{ inputs.codex-auth-json-b64 }}
         INPUT_OPENAI_API_KEY: ${{ inputs.openai-api-key }}
-        INPUT_OPENCODE_AUTH_JSON_B64: ${{ inputs.opencode-auth-json-b64 }}
       run: node "${{ github.action_path }}/src/auth.mjs"
 
     - name: Run review
@@ -83,5 +83,4 @@ runs:
         INPUT_CONFIG_PATH: ${{ inputs.config-path }}
         INPUT_TIMEOUT_MINUTES: ${{ inputs.timeout-minutes }}
         INPUT_COMMAND: ${{ inputs.command }}
-        ACTION_PATH: ${{ github.action_path }}
       run: node "${{ github.action_path }}/src/main.mjs"

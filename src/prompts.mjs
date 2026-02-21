@@ -125,7 +125,7 @@ export function buildFilePrompt({ file, fileClass, numberedDiff, maxFindings }) 
 			: `This is production code. Apply full review rigor.`;
 
 	return [
-		`Review ONLY this file's diff. Apply the mental models from our earlier conversation.`,
+		`Review ONLY this file's diff. Apply the mental models from the instructions above.`,
 		`File: ${file}`,
 		``,
 		fileTypeContext,

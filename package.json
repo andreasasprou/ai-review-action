@@ -1,8 +1,8 @@
 {
   "name": "ai-review-action",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "type": "module",
-  "description": "AI-powered code review GitHub Action using OpenCode SDK",
+  "description": "AI-powered code review GitHub Action using Codex CLI",
   "license": "MIT",
   "private": true,
   "scripts": {
@@ -12,10 +12,7 @@
     "node": ">=22"
   },
   "dependencies": {
-    "@openai/codex-sdk": "^0.104.0",
-    "@opencode-ai/sdk": "^1.2.10",
     "js-yaml": "^4.1.0",
-    "opencode-ai": "^1.2.10",
     "picomatch": "^4.0.0"
   }
 }

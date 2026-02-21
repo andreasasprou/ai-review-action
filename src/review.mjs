@@ -1,6 +1,7 @@
 // Per-file code review orchestrator.
-// Sends each file's diff to the model, collects structured findings,
-// posts inline PR comments, and updates the dashboard after each file.
+// Sends each file's diff to the model via Codex CLI (`codex exec`),
+// collects structured findings, posts inline PR comments, and updates
+// the dashboard after each file.
 
 import { execFileSync } from "node:child_process";
 import { createClassifier } from "./classify.mjs";
@@ -9,8 +10,7 @@ import { buildFilePrompt, buildSystemPrompt } from "./prompts.mjs";
 import {
 	ghApi,
 	parseProviderModel,
-	sendPromptAndCollect,
-	startOpencode,
+	sendCodexPrompt,
 	withRetry,
 } from "./shared.mjs";
 
@@ -125,7 +125,7 @@ export async function runReview(ctx) {
 		config,
 	} = ctx;
 
-	const { providerID, modelID } = parseProviderModel(model);
+	const { modelID } = parseProviderModel(model);
 	const classify = createClassifier(config);
 
 	// Agent key for dashboard namespace isolation
@@ -135,17 +135,21 @@ export async function runReview(ctx) {
 	const maxFindings = config.review?.max_findings_per_file || 3;
 	const MAX_TOTAL_FINDINGS = config.review?.max_total_findings || 15;
 	const MAX_COMMENTABLE_LINES = 1500;
-	const PER_PROMPT_TIMEOUT_MS = 90_000; // 90 seconds per LLM call
+	const PER_PROMPT_TIMEOUT_MS = 120_000; // 120 seconds per codex exec call
 	const MAX_RETRY_ATTEMPTS = 2;
 	const MAX_CONSECUTIVE_FAILURES = 3;
 	// Leave 4 minutes for cleanup, dashboard update, and post-step
 	const RUNTIME_BUDGET_MS = 16 * 60 * 1000;
 
 	const state = previousState || {};
+	const reasoningEffort = config.model_options?.reasoningEffort;
 
 	console.log(`Starting review for PR #${prNumber}`);
-	console.log(`Model: ${model} (${providerID}/${modelID})`);
+	console.log(`Model: ${model} (codex exec -m ${modelID})`);
 	console.log(`Diff: ${diffBaseSha.slice(0, 8)}..${headSha.slice(0, 8)}`);
+	if (reasoningEffort) {
+		console.log(`Reasoning effort: ${reasoningEffort}`);
+	}
 
 	// ── Dashboard init ──
 	if (dashboardCommentId) {
@@ -179,72 +183,151 @@ export async function runReview(ctx) {
 	}
 
 	const startTime = Date.now();
-	const opencode = await startOpencode(model);
 
-	try {
-		// ── Session management ──
-		const created = await opencode.client.session.create({
-			body: { title: `PR #${prNumber} Review (${model})` },
-		});
-		const sessionId = created.data.id;
-		console.log(`Created session ${sessionId}`);
+	// ── Build system context ──
+	// Codex exec is stateless (no session persistence), so we prepend the
+	// system prompt and file list to every per-file prompt.
+	const systemPrompt = buildSystemPrompt({
+		prNumber,
+		prTitle,
+		prBody,
+		headSha,
+		diffBaseSha,
+		openIssues: state.open_issues,
+		guidelinesContent,
+		config,
+	});
 
-		// ── Inject system context (noReply) ──
-		const systemPrompt = buildSystemPrompt({
-			prNumber,
-			prTitle,
-			prBody,
-			headSha,
-			diffBaseSha,
-			openIssues: state.open_issues,
-			guidelinesContent,
-			config,
-		});
+	// Resume support: skip files already reviewed for the same head SHA
+	const alreadyReviewed = new Set(
+		state.in_progress?.head_sha === headSha
+			? state.in_progress?.reviewed_files || []
+			: [],
+	);
 
-		await opencode.client.session.prompt({
-			path: { id: sessionId },
-			body: {
-				noReply: true,
-				parts: [{ type: "text", text: systemPrompt }],
-			},
-		});
+	const reviewableFiles = changedFiles.filter(
+		(f) => classify(f) !== "skip",
+	);
+	const fileListText = reviewableFiles
+		.map((f) => `- ${f} (${classify(f)})`)
+		.join("\n");
 
-		// ── Build file list and inject cross-file context ──
-		// Resume support: skip files already reviewed for the same head SHA
-		const alreadyReviewed = new Set(
-			state.in_progress?.head_sha === headSha
-				? state.in_progress?.reviewed_files || []
-				: [],
-		);
+	const systemContext = [
+		systemPrompt,
+		"",
+		"## Files in this PR:",
+		fileListText,
+		"",
+		"When reviewing individual files, remember that changes in one file",
+		"may be complemented by changes in other files. Do not flag issues",
+		"that are addressed by other changed files in this PR.",
+	].join("\n");
 
-		const reviewableFiles = changedFiles.filter(
-			(f) => classify(f) !== "skip",
-		);
-		const fileListText = reviewableFiles
-			.map((f) => `- ${f} (${classify(f)})`)
-			.join("\n");
-
-		await opencode.client.session.prompt({
-			path: { id: sessionId },
-			body: {
-				noReply: true,
-				parts: [
-					{
-						type: "text",
-						text: [
-							`## Files in this PR:`,
-							fileListText,
-							``,
-							`When reviewing individual files, remember that changes in one file`,
-							`may be complemented by changes in other files. Do not flag issues`,
-							`that are addressed by other changed files in this PR.`,
-						].join("\n"),
+	// Update dashboard with total file count
+	if (dashboardCommentId) {
+		try {
+			await updateDashboardAgent({
+				token,
+				owner,
+				repo,
+				prNumber,
+				commentId: dashboardCommentId,
+				agentKey: AGENT_KEY,
+				updater: (current) => ({
+					...current,
+					progress: {
+						...current.progress,
+						total_files: changedFiles.length,
+						completed_files: alreadyReviewed.size,
+						reviewed_files: [...alreadyReviewed],
 					},
-				],
-			},
-		});
+				}),
+				config,
+			});
+		} catch (err) {
+			console.log(`Dashboard update failed (non-fatal): ${err.message}`);
+		}
+	}
 
-		// Update dashboard with total file count
+	let totalFindings = 0;
+	let consecutiveFailures = 0;
+	let reviewCapped = false;
+	const allFindings = [];
+	const reviewedFiles = [...alreadyReviewed];
+	const fileResults = {};
+
+	// Prioritize: production code first, then relaxed (tests/scripts/config).
+	// This ensures the runtime budget is spent on the most important files.
+	const prioritized = [...changedFiles].sort((a, b) => {
+		const priority = { standard: 0, relaxed: 1, skip: 2 };
+		return (
+			(priority[classify(a)] ?? 2) - (priority[classify(b)] ?? 2)
+		);
+	});
+
+	for (const file of prioritized) {
+		if (alreadyReviewed.has(file)) {
+			console.log(`Skipping ${file} (already reviewed in checkpoint)`);
+			continue;
+		}
+
+		const fileClass = classify(file);
+		if (fileClass === "skip") {
+			console.log(`Skipping ${file} (non-reviewable file type)`);
+			reviewedFiles.push(file);
+			fileResults[file] = { status: "skipped", findings_count: 0 };
+			continue;
+		}
+
+		// Generate per-file diff
+		let patch;
+		try {
+			patch = execFileSync(
+				"git",
+				["diff", `${diffBaseSha}..${headSha}`, "--", file],
+				{ encoding: "utf8", maxBuffer: 50 * 1024 * 1024 },
+			);
+		} catch (err) {
+			console.log(`Failed to get diff for ${file}: ${err.message}`);
+			continue;
+		}
+
+		if (!patch.trim()) {
+			reviewedFiles.push(file);
+			fileResults[file] = { status: "clean", findings_count: 0 };
+			continue;
+		}
+
+		const { numbered, commentable } = buildNumberedRightDiff(patch);
+
+		// Skip files with very large diffs — they consume too much LLM time
+		// and are typically refactors/moves where line-by-line review adds little value.
+		if (commentable.size > MAX_COMMENTABLE_LINES) {
+			console.log(
+				`Skipping ${file} (${commentable.size} commentable lines exceeds ${MAX_COMMENTABLE_LINES} cap)`,
+			);
+			reviewedFiles.push(file);
+			fileResults[file] = {
+				status: "skipped_large",
+				findings_count: 0,
+			};
+			continue;
+		}
+
+		// Runtime budget check — exit gracefully before the hard timeout kills us
+		if (Date.now() - startTime > RUNTIME_BUDGET_MS) {
+			console.log(
+				`Runtime budget exhausted (${Math.round((Date.now() - startTime) / 1000)}s), stopping review`,
+			);
+			reviewCapped = true;
+			break;
+		}
+
+		console.log(
+			`Reviewing ${file} (${commentable.size} commentable lines)...`,
+		);
+
+		// Update dashboard: current file
 		if (dashboardCommentId) {
 			try {
 				await updateDashboardAgent({
@@ -258,343 +341,166 @@ export async function runReview(ctx) {
 						...current,
 						progress: {
 							...current.progress,
-							total_files: changedFiles.length,
-							completed_files: alreadyReviewed.size,
-							reviewed_files: [...alreadyReviewed],
+							current_file: file,
 						},
 					}),
 					config,
 				});
 			} catch (err) {
-				console.log(`Dashboard update failed (non-fatal): ${err.message}`);
+				console.log(
+					`Dashboard progress update failed (non-fatal): ${err.message}`,
+				);
 			}
 		}
 
-		let totalFindings = 0;
-		let consecutiveFailures = 0;
-		let reviewCapped = false;
-		const allFindings = [];
-		const reviewedFiles = [...alreadyReviewed];
-		const fileResults = {};
-
-		// Prioritize: production code first, then relaxed (tests/scripts/config).
-		// This ensures the runtime budget is spent on the most important files.
-		const prioritized = [...changedFiles].sort((a, b) => {
-			const priority = { standard: 0, relaxed: 1, skip: 2 };
-			return (
-				(priority[classify(a)] ?? 2) - (priority[classify(b)] ?? 2)
-			);
+		const filePrompt = buildFilePrompt({
+			file,
+			fileClass,
+			numberedDiff: numbered,
+			maxFindings,
 		});
 
-		for (const file of prioritized) {
-			if (alreadyReviewed.has(file)) {
-				console.log(`Skipping ${file} (already reviewed in checkpoint)`);
-				continue;
-			}
+		// Combine system context with per-file prompt for stateless codex exec
+		const combinedPrompt = `${systemContext}\n\n---\n\n${filePrompt}`;
 
-			const fileClass = classify(file);
-			if (fileClass === "skip") {
-				console.log(`Skipping ${file} (non-reviewable file type)`);
-				reviewedFiles.push(file);
-				fileResults[file] = { status: "skipped", findings_count: 0 };
-				continue;
-			}
+		let structured = { comments: [] };
+		let promptSucceeded = false;
+		try {
+			const responseText = await withRetry(
+				() =>
+					sendCodexPrompt(combinedPrompt, {
+						model: modelID,
+						timeoutMs: PER_PROMPT_TIMEOUT_MS,
+						reasoningEffort,
+					}),
+				{ maxAttempts: MAX_RETRY_ATTEMPTS, baseDelayMs: 3000 },
+			);
 
-			// Generate per-file diff
-			let patch;
-			try {
-				patch = execFileSync(
-					"git",
-					["diff", `${diffBaseSha}..${headSha}`, "--", file],
-					{ encoding: "utf8", maxBuffer: 50 * 1024 * 1024 },
-				);
-			} catch (err) {
-				console.log(`Failed to get diff for ${file}: ${err.message}`);
-				continue;
-			}
+			// Transport succeeded — reset circuit breaker regardless of parse outcome
+			promptSucceeded = true;
+			consecutiveFailures = 0;
 
-			if (!patch.trim()) {
-				reviewedFiles.push(file);
-				fileResults[file] = { status: "clean", findings_count: 0 };
-				continue;
-			}
-
-			const { numbered, commentable } = buildNumberedRightDiff(patch);
-
-			// Skip files with very large diffs — they consume too much LLM time
-			// and are typically refactors/moves where line-by-line review adds little value.
-			if (commentable.size > MAX_COMMENTABLE_LINES) {
+			if (process.env.DEBUG_CODEX) {
 				console.log(
-					`Skipping ${file} (${commentable.size} commentable lines exceeds ${MAX_COMMENTABLE_LINES} cap)`,
+					`  [DEBUG] response text (first 500): ${responseText.slice(0, 500)}`,
 				);
-				reviewedFiles.push(file);
+			}
+
+			// Parse JSON from the response (strip markdown fences if present)
+			const jsonText = responseText
+				.replace(/^```(?:json)?\s*\n?/m, "")
+				.replace(/\n?```\s*$/m, "")
+				.trim();
+			if (jsonText) {
+				structured = JSON.parse(jsonText);
+			}
+		} catch (err) {
+			console.log(`Model prompt failed for ${file}: ${err.message}`);
+			if (!promptSucceeded) {
+				// Only count transport/process failures toward the circuit breaker,
+				// not JSON parse errors from a successful but malformed response.
+				consecutiveFailures++;
+				if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+					console.log(
+						`${MAX_CONSECUTIVE_FAILURES} consecutive transport failures — Codex CLI likely unhealthy, stopping review`,
+					);
+					reviewCapped = true;
+					break;
+				}
+				// Don't record the file as reviewed — it wasn't.
+				// This allows resume runs to re-attempt it.
 				fileResults[file] = {
-					status: "skipped_large",
+					status: "failed",
 					findings_count: 0,
 				};
 				continue;
 			}
+		}
 
-			// Runtime budget check — exit gracefully before the hard timeout kills us
-			if (Date.now() - startTime > RUNTIME_BUDGET_MS) {
-				console.log(
-					`Runtime budget exhausted (${Math.round((Date.now() - startTime) / 1000)}s), stopping review`,
-				);
-				reviewCapped = true;
-				break;
-			}
-
-			console.log(
-				`Reviewing ${file} (${commentable.size} commentable lines)...`,
-			);
-
-			// Update dashboard: current file
-			if (dashboardCommentId) {
-				try {
-					await updateDashboardAgent({
-						token,
-						owner,
-						repo,
-						prNumber,
-						commentId: dashboardCommentId,
-						agentKey: AGENT_KEY,
-						updater: (current) => ({
-							...current,
-							progress: {
-								...current.progress,
-								current_file: file,
-							},
-						}),
-						config,
-					});
-				} catch (err) {
-					console.log(
-						`Dashboard progress update failed (non-fatal): ${err.message}`,
-					);
-				}
-			}
-
-			const prompt = buildFilePrompt({
-				file,
-				fileClass,
-				numberedDiff: numbered,
-				maxFindings,
-			});
-
-			let structured = { comments: [] };
-			let promptSucceeded = false;
-			try {
-				const responseText = await withRetry(
-					() =>
-						sendPromptAndCollect(
-							opencode,
-							sessionId,
-							prompt,
-							{ providerID, modelID },
-							PER_PROMPT_TIMEOUT_MS,
-						),
-					{ maxAttempts: MAX_RETRY_ATTEMPTS, baseDelayMs: 3000 },
-				);
-
-				// Transport succeeded — reset circuit breaker regardless of parse outcome
-				promptSucceeded = true;
-				consecutiveFailures = 0;
-
-				if (process.env.DEBUG_OPENCODE) {
-					console.log(
-						`  [DEBUG] response text (first 500): ${responseText.slice(0, 500)}`,
-					);
-				}
-
-				// Parse JSON from the response (strip markdown fences if present)
-				const jsonText = responseText
-					.replace(/^```(?:json)?\s*\n?/m, "")
-					.replace(/\n?```\s*$/m, "")
-					.trim();
-				if (jsonText) {
-					structured = JSON.parse(jsonText);
-				}
-			} catch (err) {
-				console.log(`Model prompt failed for ${file}: ${err.message}`);
-				if (!promptSucceeded) {
-					// Only count transport/fetch failures toward the circuit breaker,
-					// not JSON parse errors from a successful but malformed response.
-					consecutiveFailures++;
-					if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-						console.log(
-							`${MAX_CONSECUTIVE_FAILURES} consecutive transport failures — OpenCode server likely unhealthy, stopping review`,
-						);
-						reviewCapped = true;
-						break;
-					}
-					// Don't record the file as reviewed — it wasn't.
-					// This allows resume runs to re-attempt it.
-					fileResults[file] = {
-						status: "failed",
-						findings_count: 0,
-					};
-					continue;
-				}
-			}
-
-			// Severity safety net for relaxed files
-			if (fileClass === "relaxed") {
-				for (const c of structured.comments || []) {
-					const cat = (c.category || "").trim().toLowerCase();
-					if (
-						(c.severity === "P0" || c.severity === "P1") &&
-						cat !== "security"
-					) {
-						console.log(
-							`  [PROMPT-QUALITY] Capping ${c.severity} to P2 for relaxed file ${file} (${c.category}: "${c.title}")`,
-						);
-						c.severity = "P2";
-					}
-				}
-			}
-
-			// Post inline comments
-			let fileFindingsCount = 0;
+		// Severity safety net for relaxed files
+		if (fileClass === "relaxed") {
 			for (const c of structured.comments || []) {
-				if (c.path !== file) c.path = file;
-
-				const severity_emoji = {
-					P0: "\u{1F534}",
-					P1: "\u{1F7E0}",
-					P2: "\u{1F7E1}",
-				};
-				const emoji = severity_emoji[c.severity] || "";
-				const commentBody = [
-					`${emoji} **${c.severity} - ${c.category}**: ${c.title}`,
-					``,
-					c.body,
-					``,
-					`---`,
-					`<sub>${modelShort}</sub>`,
-				].join("\n");
-
-				try {
-					const anchor =
-						c.subject_type !== "file" && c.line
-							? nearestLine(Number(c.line), commentable)
-							: null;
-
-					const payload = {
-						commit_id: headSha,
-						path: file,
-						body: commentBody,
-					};
-					if (anchor) {
-						payload.side = "RIGHT";
-						payload.line = anchor;
-					} else {
-						payload.subject_type = "file";
-					}
-
-					await ghApi(
-						token,
-						`/repos/${owner}/${repo}/pulls/${prNumber}/comments`,
-						"POST",
-						payload,
-					);
-
-					totalFindings++;
-					fileFindingsCount++;
-					allFindings.push({
-						severity: c.severity,
-						category: c.category,
-						title: c.title,
-						path: file,
-					});
+				const cat = (c.category || "").trim().toLowerCase();
+				if (
+					(c.severity === "P0" || c.severity === "P1") &&
+					cat !== "security"
+				) {
 					console.log(
-						`  Posted ${c.severity} finding on ${file}:${anchor || "file-level"}`,
+						`  [PROMPT-QUALITY] Capping ${c.severity} to P2 for relaxed file ${file} (${c.category}: "${c.title}")`,
 					);
-				} catch (err) {
-					console.log(`  Failed to post comment on ${file}: ${err.message}`);
+					c.severity = "P2";
 				}
 			}
+		}
 
-			// Record file result and update dashboard
-			reviewedFiles.push(file);
-			fileResults[file] = {
-				status: fileFindingsCount > 0 ? "issues" : "clean",
-				findings_count: fileFindingsCount,
+		// Post inline comments
+		let fileFindingsCount = 0;
+		for (const c of structured.comments || []) {
+			if (c.path !== file) c.path = file;
+
+			const severity_emoji = {
+				P0: "\u{1F534}",
+				P1: "\u{1F7E0}",
+				P2: "\u{1F7E1}",
 			};
+			const emoji = severity_emoji[c.severity] || "";
+			const commentBody = [
+				`${emoji} **${c.severity} - ${c.category}**: ${c.title}`,
+				``,
+				c.body,
+				``,
+				`---`,
+				`<sub>${modelShort}</sub>`,
+			].join("\n");
 
-			if (dashboardCommentId) {
-				try {
-					await updateDashboardAgent({
-						token,
-						owner,
-						repo,
-						prNumber,
-						commentId: dashboardCommentId,
-						agentKey: AGENT_KEY,
-						updater: (current) => ({
-							...current,
-							progress: {
-								...current.progress,
-								completed_files: reviewedFiles.length,
-								current_file: null,
-								reviewed_files: reviewedFiles,
-								file_results: fileResults,
-							},
-						}),
-						config,
-					});
-				} catch (err) {
-					console.log(
-						`Dashboard checkpoint failed (non-fatal): ${err.message}`,
-					);
+			try {
+				const anchor =
+					c.subject_type !== "file" && c.line
+						? nearestLine(Number(c.line), commentable)
+						: null;
+
+				const payload = {
+					commit_id: headSha,
+					path: file,
+					body: commentBody,
+				};
+				if (anchor) {
+					payload.side = "RIGHT";
+					payload.line = anchor;
+				} else {
+					payload.subject_type = "file";
 				}
-			}
 
-			// Global finding cap
-			if (totalFindings >= MAX_TOTAL_FINDINGS) {
-				console.log(
-					`Global finding cap reached (${MAX_TOTAL_FINDINGS}), stopping review`,
+				await ghApi(
+					token,
+					`/repos/${owner}/${repo}/pulls/${prNumber}/comments`,
+					"POST",
+					payload,
 				);
-				reviewCapped = true;
-				break;
+
+				totalFindings++;
+				fileFindingsCount++;
+				allFindings.push({
+					severity: c.severity,
+					category: c.category,
+					title: c.title,
+					path: file,
+				});
+				console.log(
+					`  Posted ${c.severity} finding on ${file}:${anchor || "file-level"}`,
+				);
+			} catch (err) {
+				console.log(`  Failed to post comment on ${file}: ${err.message}`);
 			}
 		}
 
-		// ── Run complete ──
-		const duration = Math.round((Date.now() - startTime) / 1000);
+		// Record file result and update dashboard
+		reviewedFiles.push(file);
+		fileResults[file] = {
+			status: fileFindingsCount > 0 ? "issues" : "clean",
+			findings_count: fileFindingsCount,
+		};
 
-		// Count files that were actually sent to the LLM and got a response
-		const filesActuallyReviewed = Object.values(fileResults).filter(
-			(r) => r.status === "clean" || r.status === "issues",
-		).length;
-
-		const hasP0 = allFindings.some((f) => f.severity === "P0");
-		const hasP1 = allFindings.some((f) => f.severity === "P1");
-
-		// If the review was cut short and zero files were actually reviewed
-		// (e.g., circuit breaker tripped immediately), that's an error — not a clean bill.
-		let verdict;
-		if (reviewCapped && filesActuallyReviewed === 0) {
-			verdict = "ERROR";
-		} else if (hasP0) {
-			verdict = "BLOCK";
-		} else if (hasP1) {
-			verdict = "ATTENTION";
-		} else {
-			verdict = "OK";
-		}
-
-		// Build open_issues for dashboard state
-		const openIssues = allFindings.map((f, i) => ({
-			id: `finding-${headSha.slice(0, 8)}-${i}`,
-			severity: f.severity,
-			title: `${f.category}: ${f.title}`,
-			location: f.path,
-			status: "open",
-			first_seen_head_sha: headSha,
-			last_seen_head_sha: headSha,
-		}));
-
-		// Final dashboard update: mark completed
 		if (dashboardCommentId) {
 			try {
 				await updateDashboardAgent({
@@ -606,12 +512,6 @@ export async function runReview(ctx) {
 					agentKey: AGENT_KEY,
 					updater: (current) => ({
 						...current,
-						status: "completed",
-						completed_at: new Date().toISOString(),
-						duration_seconds: duration,
-						last_reviewed_head_sha: reviewCapped
-							? state.last_reviewed_head_sha || diffBaseSha
-							: headSha,
 						progress: {
 							...current.progress,
 							completed_files: reviewedFiles.length,
@@ -619,41 +519,118 @@ export async function runReview(ctx) {
 							reviewed_files: reviewedFiles,
 							file_results: fileResults,
 						},
-						results: {
-							verdict,
-							total_findings: totalFindings,
-							findings: allFindings.map((f) => ({
-								severity: f.severity,
-								category: f.category,
-								title: f.title,
-								path: f.path,
-							})),
-						},
-						open_issues: openIssues,
 					}),
 					config,
-					isFinal: true,
 				});
 			} catch (err) {
-				console.log(`Dashboard final update failed: ${err.message}`);
+				console.log(
+					`Dashboard checkpoint failed (non-fatal): ${err.message}`,
+				);
 			}
 		}
 
-		console.log(
-			`Review complete: ${verdict} (${totalFindings} findings across ${reviewedFiles.length} files) in ${duration}s`,
-		);
-
-		return {
-			verdict,
-			totalFindings,
-			allFindings,
-			reviewedFiles,
-			fileResults,
-			reviewCapped,
-			duration,
-			openIssues,
-		};
-	} finally {
-		opencode.server.close();
+		// Global finding cap
+		if (totalFindings >= MAX_TOTAL_FINDINGS) {
+			console.log(
+				`Global finding cap reached (${MAX_TOTAL_FINDINGS}), stopping review`,
+			);
+			reviewCapped = true;
+			break;
+		}
 	}
+
+	// ── Run complete ──
+	const duration = Math.round((Date.now() - startTime) / 1000);
+
+	// Count files that were actually sent to the LLM and got a response
+	const filesActuallyReviewed = Object.values(fileResults).filter(
+		(r) => r.status === "clean" || r.status === "issues",
+	).length;
+
+	const hasP0 = allFindings.some((f) => f.severity === "P0");
+	const hasP1 = allFindings.some((f) => f.severity === "P1");
+
+	// If the review was cut short and zero files were actually reviewed
+	// (e.g., circuit breaker tripped immediately), that's an error — not a clean bill.
+	let verdict;
+	if (reviewCapped && filesActuallyReviewed === 0) {
+		verdict = "ERROR";
+	} else if (hasP0) {
+		verdict = "BLOCK";
+	} else if (hasP1) {
+		verdict = "ATTENTION";
+	} else {
+		verdict = "OK";
+	}
+
+	// Build open_issues for dashboard state
+	const openIssues = allFindings.map((f, i) => ({
+		id: `finding-${headSha.slice(0, 8)}-${i}`,
+		severity: f.severity,
+		title: `${f.category}: ${f.title}`,
+		location: f.path,
+		status: "open",
+		first_seen_head_sha: headSha,
+		last_seen_head_sha: headSha,
+	}));
+
+	// Final dashboard update: mark completed
+	if (dashboardCommentId) {
+		try {
+			await updateDashboardAgent({
+				token,
+				owner,
+				repo,
+				prNumber,
+				commentId: dashboardCommentId,
+				agentKey: AGENT_KEY,
+				updater: (current) => ({
+					...current,
+					status: "completed",
+					completed_at: new Date().toISOString(),
+					duration_seconds: duration,
+					last_reviewed_head_sha: reviewCapped
+						? state.last_reviewed_head_sha || diffBaseSha
+						: headSha,
+					progress: {
+						...current.progress,
+						completed_files: reviewedFiles.length,
+						current_file: null,
+						reviewed_files: reviewedFiles,
+						file_results: fileResults,
+					},
+					results: {
+						verdict,
+						total_findings: totalFindings,
+						findings: allFindings.map((f) => ({
+							severity: f.severity,
+							category: f.category,
+							title: f.title,
+							path: f.path,
+						})),
+					},
+					open_issues: openIssues,
+				}),
+				config,
+				isFinal: true,
+			});
+		} catch (err) {
+			console.log(`Dashboard final update failed: ${err.message}`);
+		}
+	}
+
+	console.log(
+		`Review complete: ${verdict} (${totalFindings} findings across ${reviewedFiles.length} files) in ${duration}s`,
+	);
+
+	return {
+		verdict,
+		totalFindings,
+		allFindings,
+		reviewedFiles,
+		fileResults,
+		reviewCapped,
+		duration,
+		openIssues,
+	};
 }

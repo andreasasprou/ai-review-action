@@ -5,7 +5,6 @@
 
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
-import path from "node:path";
 import { loadConfig, loadContextFiles } from "./config.mjs";
 import {
 	buildMarkers,
@@ -14,7 +13,7 @@ import {
 	renderDashboard,
 } from "./dashboard.mjs";
 import { runReview } from "./review.mjs";
-import { ghApi, parseProviderModel } from "./shared.mjs";
+import { ghApi } from "./shared.mjs";
 
 // ── Environment ──────────────────────────────────────────────────────────────
 
@@ -29,7 +28,6 @@ const {
 	INPUT_CONFIG_PATH,
 	INPUT_TIMEOUT_MINUTES,
 	INPUT_COMMAND,
-	ACTION_PATH,
 } = process.env;
 
 if (!GITHUB_TOKEN || !GITHUB_REPOSITORY) {
@@ -334,49 +332,6 @@ function generateChangedFiles(mergeBaseSha, diffBaseSha, headSha) {
 	return changedFiles;
 }
 
-// ── OpenCode config generation ───────────────────────────────────────────────
-
-function generateOpencodeConfig(model, config) {
-	const { providerID, modelID } = parseProviderModel(model);
-	const modelOptions = config.model_options || {};
-
-	const opencodeConfig = {
-		model: `${providerID}/${modelID}`,
-		provider: {},
-	};
-
-	// Set model-specific options (e.g., reasoningEffort)
-	if (Object.keys(modelOptions).length > 0) {
-		opencodeConfig.provider[providerID] = {
-			models: {
-				[modelID]: {
-					options: modelOptions,
-				},
-			},
-		};
-	}
-
-	// Check if using OpenCode auth mode — include codex auth plugin
-	const authModeFile = path.join(
-		process.env.HOME || "",
-		".local/share/opencode/.auth-mode",
-	);
-	if (fs.existsSync(authModeFile)) {
-		const authMode = fs.readFileSync(authModeFile, "utf8").trim();
-		if (authMode === "opencode") {
-			const pluginPath = ACTION_PATH
-				? path.join(ACTION_PATH, "node_modules/opencode-openai-codex-auth")
-				: "opencode-openai-codex-auth";
-			opencodeConfig.plugin = [pluginPath];
-			console.log(`Using OpenCode codex auth plugin: ${pluginPath}`);
-		}
-	}
-
-	// Write opencode.json to current directory
-	fs.writeFileSync("opencode.json", JSON.stringify(opencodeConfig, null, 2));
-	console.log(`Generated opencode.json for ${model}`);
-}
-
 // ── Dashboard cancel/fail handler ────────────────────────────────────────────
 
 async function updateDashboardOnFailure(dashboardCommentId, model, status, config) {
@@ -603,9 +558,6 @@ async function main() {
 			return;
 		}
 
-		// ── Generate opencode.json ──
-		generateOpencodeConfig(model, config);
-
 		// ── Load context files ──
 		const guidelinesContent = loadContextFiles(config.context_files || []);
 
@@ -670,8 +622,6 @@ async function main() {
 			`Done: ${result.verdict} (${result.totalFindings} findings, ${result.duration}s)`,
 		);
 
-		// Explicitly exit — the OpenCode server spawns child processes that can
-		// keep the Node event loop alive even after server.close().
 		process.exit(0);
 	} catch (err) {
 		console.error("Review failed:", err);
