@@ -135,7 +135,7 @@ export async function runReview(ctx) {
 	const maxFindings = config.review?.max_findings_per_file || 3;
 	const MAX_TOTAL_FINDINGS = config.review?.max_total_findings || 15;
 	const MAX_COMMENTABLE_LINES = 1500;
-	const PER_PROMPT_TIMEOUT_MS = 120_000; // 120 seconds per codex exec call
+	const PER_PROMPT_TIMEOUT_MS = 300_000; // 5 minutes per codex exec call (xhigh reasoning needs headroom)
 	const MAX_RETRY_ATTEMPTS = 2;
 	const MAX_CONSECUTIVE_FAILURES = 3;
 	// Leave 4 minutes for cleanup, dashboard update, and post-step
